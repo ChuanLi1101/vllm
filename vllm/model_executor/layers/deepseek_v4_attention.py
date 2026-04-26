@@ -1593,7 +1593,11 @@ class DeepseekV4Indexer(nn.Module):
         q = apply_gptj_rope_ref(q, positions, cos_sin_cache, self.rope_dim).to(
             torch.bfloat16
         )
-        q = hadamard_transform_ref(q).to(torch.float32)
+        # E1 DEBUG: Hadamard disabled. NV indexer kernels
+        # (_fused_indexer_q_rope_quant_kernel,
+        # _fused_kv_compress_norm_rope_insert_indexer_attn) do NOT apply Hadamard.
+        # Applying it on ROCm-only diverges from the NV reference numerics.
+        q = q.to(torch.float32)
         fp8_max = 224.0 if current_platform.is_fp8_fnuz() else 448.0
         q_scale = torch.abs(q).amax(dim=-1).clamp(min=1e-12) / fp8_max
         q_quant = (q / q_scale.unsqueeze(-1)).to(current_platform.fp8_dtype())
