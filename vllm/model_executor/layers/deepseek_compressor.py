@@ -591,8 +591,18 @@ class DeepseekCompressor(nn.Module):
                     f"{compressed_positions.numel()} vs {kv_compressed.shape[0]}"
                 )
 
+            # NV-equivalent: rotate the compressed K with the position of the
+            # FIRST token of its chunk, i.e. (p // CR) * CR.  The original
+            # ROCm path used the LAST token's position (p), which produces a
+            # (compress_ratio - 1)-token RoPE offset versus
+            # _fused_kv_compress_norm_rope_insert_indexer_attn /
+            # _fused_kv_compress_norm_rope_insert_sparse_attn (NV reference)
+            # and corrupts every q.k inner product downstream.
+            rope_positions = (
+                compressed_positions // self.compress_ratio
+            ) * self.compress_ratio
             kv_compressed = apply_gptj_rope_ref(
-                kv_compressed, compressed_positions, rotary_emb.cos_sin_cache, self.rope_head_dim
+                kv_compressed, rope_positions, rotary_emb.cos_sin_cache, self.rope_head_dim
             ).to(torch.bfloat16)
             if self._old_need_hadamard:
                 kv_compressed = hadamard_transform_ref(kv_compressed)
