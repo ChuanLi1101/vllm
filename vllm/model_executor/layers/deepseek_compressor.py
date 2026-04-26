@@ -292,10 +292,7 @@ class DeepseekCompressor(nn.Module):
         )
         self._old_kv_state: dict[str, torch.Tensor] = {}
         self._old_score_state: dict[str, torch.Tensor] = {}
-        # E1 DEBUG: force Hadamard OFF for indexer K (head_dim==128) compressor.
-        # NV's _fused_kv_compress_norm_rope_insert_indexer_attn does NOT apply
-        # Hadamard, so applying it on ROCm-only diverges from NV ref numerics.
-        self._old_need_hadamard = False
+        self._old_need_hadamard = self.head_dim == 128
 
         if self.head_dim == 512:
             assert not use_fp4_cache, (
