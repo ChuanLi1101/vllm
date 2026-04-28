@@ -1153,6 +1153,24 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         for ~2-3x decode speedup over the torch reference at high batch sizes.
         This is the only sparse-attention decode path on ROCm.
         """
+        # Diagnostic escape hatch: if VLLM_DSV4_AITER_USE_REF=1, dispatch to
+        # the reference (PyTorch) decode path. Used to triangulate whether a
+        # crash/incorrectness is in the AITER kernel/setup or in the upstream
+        # buffer layout. Remove once the V4-Flash investigation is closed.
+        import os as _os
+        if _os.environ.get("VLLM_DSV4_AITER_USE_REF", "0") == "1":
+            return self._forward_decode_fallback(
+                q=q,
+                kv_cache=kv_cache,
+                swa_metadata=None,  # type: ignore[arg-type]  # unused by fallback
+                swa_only=swa_only,
+                topk_indices=topk_indices,
+                topk_lens=topk_lens,
+                swa_indices=swa_indices,
+                swa_lens=swa_lens,
+                output=output,
+            )
+
         from vllm.v1.attention.ops.rocm_aiter_dsv4_decode import (
             AiterSparseScratch,
             aiter_sparse_attn_decode,

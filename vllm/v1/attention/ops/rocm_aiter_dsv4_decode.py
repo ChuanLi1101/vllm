@@ -18,11 +18,53 @@ Key design decisions (validated on MI355X, see benchmarks/dsv4_mi355/PLAN.md §1
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+# Diagnostic instrumentation for the V4-Flash Memory-access-fault investigation.
+# Set VLLM_DSV4_AITER_DEBUG=1 to dump the first few calls. Set
+# VLLM_DSV4_AITER_DEBUG_MAX=N to bound the number of dumps (default 4).
+# Set VLLM_DSV4_AITER_SKIP=1 to short-circuit the AITER kernel call and return
+# zeros instead -- if that bypasses the fault, the fault is in the kernel call
+# (or its inputs); if it still faults, the fault is upstream of our function.
+_DEBUG = bool(int(os.environ.get("VLLM_DSV4_AITER_DEBUG", "0")))
+_DEBUG_MAX = int(os.environ.get("VLLM_DSV4_AITER_DEBUG_MAX", "4"))
+_SKIP_KERNEL = bool(int(os.environ.get("VLLM_DSV4_AITER_SKIP", "0")))
+_dump_count = 0
+
+
+def _t(name: str, t: torch.Tensor | None) -> str:
+    if t is None:
+        return f"{name}=None"
+    try:
+        # Materialize a few stats; .item() on min/max forces a sync, which is
+        # exactly what we want here -- if the tensor's data ptr is bogus, we
+        # crash here (in Python) instead of inside the AITER kernel.
+        if t.numel() == 0:
+            stats = "empty"
+        elif t.dtype in (torch.int32, torch.int64):
+            stats = f"min={int(t.min().item())} max={int(t.max().item())}"
+        elif t.dtype.is_floating_point:
+            stats = (
+                f"min={float(t.min().item()):.3e} "
+                f"max={float(t.max().item()):.3e} "
+                f"nan={int(t.isnan().sum().item())} "
+                f"inf={int(t.isinf().sum().item())}"
+            )
+        else:
+            stats = "n/a"
+    except Exception as e:  # noqa: BLE001
+        stats = f"<stats failed: {e}>"
+    return (
+        f"{name}: shape={tuple(t.shape)} dtype={t.dtype} "
+        f"contig={t.is_contiguous()} ptr=0x{t.data_ptr():x} {stats}"
+    )
 
 
 class AiterSparseScratch:
@@ -152,6 +194,31 @@ def aiter_sparse_attn_decode(
     b, s_q, h_q, d_qk = q.shape
     d_v = head_dim
     device = q.device
+
+    global _dump_count
+    if _DEBUG and _dump_count < _DEBUG_MAX:
+        _dump_count += 1
+        print(
+            f"\n[DSV4-AITER #{_dump_count}] aiter_sparse_attn_decode entry "
+            f"b={b} s_q={s_q} h_q={h_q} d_qk={d_qk} d_v={d_v} "
+            f"scale={scale} skip_kernel={_SKIP_KERNEL}\n  "
+            + "\n  ".join([
+                _t("q", q),
+                _t("blocked_k", blocked_k),
+                _t("indices_in_kvcache", indices_in_kvcache),
+                _t("topk_length", topk_length),
+                _t("attn_sink", attn_sink),
+                _t("extra_blocked_k", extra_blocked_k),
+                _t("extra_indices_in_kvcache", extra_indices_in_kvcache),
+                _t("extra_topk_length", extra_topk_length),
+            ]),
+            flush=True,
+        )
+
+    if _SKIP_KERNEL:
+        # Bypass the AITER kernel entirely -- return zeros to confirm whether
+        # the fault is in the kernel call or upstream of our function.
+        return torch.zeros((b, h_q, d_v), dtype=torch.bfloat16, device=device)
 
     # Head-split workaround for the AITER persistent ASM kernel
     # `mla_a8w8_qh64_qseqlen4_gqaratio16_lse_ps` (selected when h_q==64, e.g.
@@ -313,6 +380,41 @@ def _aiter_decode_one_scope(
     kv_view = kv_fp8.view(-1, 1, 1, d_qk)
     q_scale = torch.ones(1, dtype=torch.float32, device=device)
     kv_scale = torch.ones(1, dtype=torch.float32, device=device)
+
+    if _DEBUG and _dump_count <= _DEBUG_MAX:
+        n_kv_rows = kv_view.shape[0]
+        kv_idx_min = int(kv_indices.min().item()) if kv_indices.numel() else 0
+        kv_idx_max = int(kv_indices.max().item()) if kv_indices.numel() else 0
+        n_neg_one = int((kv_indices == -1).sum().item())
+        n_oob = int((kv_indices >= n_kv_rows).sum().item())
+        print(
+            f"[DSV4-AITER kernel-call #{_dump_count}] "
+            f"total_q={total_q} h_q={h_q} d_qk={d_qk} d_v={d_v} "
+            f"topk_max={topk_max} sm_scale={sm_scale}\n  "
+            + "\n  ".join([
+                _t("q_fp8", q_fp8),
+                _t("kv_view", kv_view),
+                _t("out_buf", out_buf),
+                _t("qo_indptr", qo_indptr),
+                _t("kv_indptr", kv_indptr),
+                _t("kv_indices", kv_indices),
+                _t("kv_last_page_lens", kv_last_page_lens),
+                _t("valid_lens", valid_lens),
+                _t("q_scale", q_scale),
+                _t("kv_scale", kv_scale),
+                _t("scratch.work_meta_data", scratch.work_meta_data),
+                _t("scratch.work_indptr", scratch.work_indptr),
+                _t("scratch.work_info_set", scratch.work_info_set),
+                _t("scratch.reduce_indptr", scratch.reduce_indptr),
+                _t("scratch.reduce_final_map", scratch.reduce_final_map),
+                _t("scratch.reduce_partial_map", scratch.reduce_partial_map),
+            ])
+            + (
+                f"\n  n_kv_rows={n_kv_rows} kv_indices_neg1={n_neg_one} "
+                f"kv_indices_oob_pos={n_oob}"
+            ),
+            flush=True,
+        )
 
     _, lse = aiter.mla.mla_decode_fwd(
         q_fp8, kv_view, out_buf,
