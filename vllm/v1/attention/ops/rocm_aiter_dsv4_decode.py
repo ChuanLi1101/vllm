@@ -470,4 +470,13 @@ def _aiter_decode_one_scope(
     if lse is None:
         raise RuntimeError("aiter.mla.mla_decode_fwd returned no LSE")
 
+    if _DEBUG and _dump_count <= _DEBUG_MAX:
+        print(
+            f"[DSV4-AITER kernel-RESULT #{_dump_count}] "
+            + _t("out_buf_after", out_buf)
+            + "\n  "
+            + _t("lse_after", lse),
+            flush=True,
+        )
+
     return out_buf, lse
