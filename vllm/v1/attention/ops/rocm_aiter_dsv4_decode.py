@@ -107,9 +107,10 @@ class AiterSparseScratch:
         max_split_per_batch: int,
         device: torch.device,
     ) -> None:
-        key = (batch_size, nhead, dtype, kvtype, max_split_per_batch, device)
-        if self._alloc_key == key:
-            return
+        # NB: temporarily disable buffer caching while we hunt the V4-Flash
+        # token-2 garbage-output bug. Always allocate fresh + zero-init so we
+        # can rule out partial-overwrite leftover state.
+        # TODO: re-enable cache once the underlying bug is found.
         import aiter
         (
             (wmd_size, wmd_type),
@@ -123,19 +124,18 @@ class AiterSparseScratch:
             is_sparse=True, fast_mode=True,
             num_kv_splits=max_split_per_batch,
         )
-        self.work_meta_data = torch.empty(
+        self.work_meta_data = torch.zeros(
             wmd_size, dtype=wmd_type, device=device)
-        self.work_indptr = torch.empty(
+        self.work_indptr = torch.zeros(
             wi_size, dtype=wi_type, device=device)
-        self.work_info_set = torch.empty(
+        self.work_info_set = torch.zeros(
             wis_size, dtype=wis_type, device=device)
-        self.reduce_indptr = torch.empty(
+        self.reduce_indptr = torch.zeros(
             ri_size, dtype=ri_type, device=device)
-        self.reduce_final_map = torch.empty(
+        self.reduce_final_map = torch.zeros(
             rfm_size, dtype=rfm_type, device=device)
-        self.reduce_partial_map = torch.empty(
+        self.reduce_partial_map = torch.zeros(
             rpm_size, dtype=rpm_type, device=device)
-        self._alloc_key = key
 
     def rebuild(
         self,
