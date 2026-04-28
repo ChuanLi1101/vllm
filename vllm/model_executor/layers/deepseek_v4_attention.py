@@ -1188,12 +1188,26 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             else self._dequantize_blocked_k_cache(kv_cache)
         )
 
+        # Strip FlashMLA's head-padding before the AITER call. q arrives padded
+        # to self.padded_heads (64 or 128) for the FlashMLA NV path, but the
+        # AITER persistent ASM kernel does not need this padding -- and feeding
+        # it zero-padded q + -inf attn_sink rows causes the kernel to emit NaN
+        # in the padded slots (validated on V4-Flash TP=4 with h_q=16 real /
+        # h_q=64 padded: padded sub-half had q==0 + sink==-inf -> NaN
+        # propagation). The padded heads of `output` are discarded by the
+        # outer wrapper (`o = o_padded[:, : n_local_heads, :]`), so we only
+        # need to fill the first n_local_heads slice. As a side benefit, with
+        # n_local_heads <= 32 the head-split workaround is bypassed entirely
+        # and we hit the stable qh16 kernel directly.
+        n_real = self.n_local_heads
+        q_real = q[:, :n_real, :].contiguous()
+
         attn_out = aiter_sparse_attn_decode(
-            q=q.unsqueeze(1),
+            q=q_real.unsqueeze(1),
             blocked_k=blocked_swa,
             indices_in_kvcache=swa_indices.unsqueeze(1),
             topk_length=swa_lens,
-            attn_sink=self.attn_sink[:q.shape[1]],
+            attn_sink=self.attn_sink[:n_real],
             scale=self.scale,
             head_dim=self.head_dim,
             extra_blocked_k=blocked_extra,
@@ -1202,7 +1216,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             scratch=self._aiter_scratch,
             extra_scratch=self._aiter_extra_scratch,
         )
-        output.copy_(attn_out.to(output.dtype))
+        output[:, :n_real, :].copy_(attn_out.to(output.dtype))
 
     def _forward_decode_fallback(
         self,
