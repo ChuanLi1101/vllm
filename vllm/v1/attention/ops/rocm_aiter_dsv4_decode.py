@@ -68,16 +68,23 @@ def _t(name: str, t: torch.Tensor | None) -> str:
 
 
 class AiterSparseScratch:
-    """Cached per-step AITER persistent-mode scratch buffers.
+    """Cached AITER persistent-mode scratch buffers + work plan.
 
-    Allocate once per metadata-build, reuse across all 61 DSv4 attn layers
-    in the same decode step. Keyed by (batch_size, nhead, topk, dtype, kvtype).
+    Buffer layout depends only on (batch_size, nhead, topk, dtype, kvtype),
+    so we cache the buffer allocation. The work-plan content, however,
+    depends on the per-step `qo_indptr / kv_indptr / kv_last_page_lens`
+    (which encode the current decode batch's valid lengths), so we
+    *always* recompute the plan via `aiter.get_mla_metadata_v1` -- caching
+    only the plan across decode steps would feed stale work to the kernel
+    and silently corrupt outputs from the second decode step onward
+    (validated on V4-Flash TP=4: first decoded token correct, subsequent
+    tokens garbage).
     """
 
     __slots__ = (
         "work_meta_data", "work_indptr", "work_info_set",
         "reduce_indptr", "reduce_final_map", "reduce_partial_map",
-        "_key",
+        "_alloc_key",
     )
 
     def __init__(self) -> None:
@@ -87,35 +94,23 @@ class AiterSparseScratch:
         self.reduce_indptr: torch.Tensor | None = None
         self.reduce_final_map: torch.Tensor | None = None
         self.reduce_partial_map: torch.Tensor | None = None
-        self._key: tuple = ()
+        # Cache the buffer-shape signature only. Work-plan content is *not*
+        # cached (see class docstring).
+        self._alloc_key: tuple = ()
 
-    def matches(
+    def _alloc_if_needed(
         self,
         batch_size: int,
         nhead: int,
-        topk: int,
         dtype: torch.dtype,
         kvtype: torch.dtype,
-    ) -> bool:
-        return self._key == (batch_size, nhead, topk, dtype, kvtype)
-
-    def rebuild(
-        self,
-        qo_indptr: torch.Tensor,
-        kv_indptr: torch.Tensor,
-        kv_last_page_lens: torch.Tensor,
-        nhead: int,
-        nhead_kv: int,
-        page_size: int,
-        topk: int,
-        dtype: torch.dtype,
-        kvtype: torch.dtype,
-        max_split_per_batch: int = 256,
+        max_split_per_batch: int,
+        device: torch.device,
     ) -> None:
+        key = (batch_size, nhead, dtype, kvtype, max_split_per_batch, device)
+        if self._alloc_key == key:
+            return
         import aiter
-
-        device = qo_indptr.device
-        bs = qo_indptr.shape[0] - 1
         (
             (wmd_size, wmd_type),
             (wi_size, wi_type),
@@ -124,7 +119,7 @@ class AiterSparseScratch:
             (rfm_size, rfm_type),
             (rpm_size, rpm_type),
         ) = aiter.get_mla_metadata_info_v1(
-            bs, 1, nhead, dtype, kvtype,
+            batch_size, 1, nhead, dtype, kvtype,
             is_sparse=True, fast_mode=True,
             num_kv_splits=max_split_per_batch,
         )
@@ -140,6 +135,29 @@ class AiterSparseScratch:
             rfm_size, dtype=rfm_type, device=device)
         self.reduce_partial_map = torch.empty(
             rpm_size, dtype=rpm_type, device=device)
+        self._alloc_key = key
+
+    def rebuild(
+        self,
+        qo_indptr: torch.Tensor,
+        kv_indptr: torch.Tensor,
+        kv_last_page_lens: torch.Tensor,
+        nhead: int,
+        nhead_kv: int,
+        page_size: int,
+        topk: int,
+        dtype: torch.dtype,
+        kvtype: torch.dtype,
+        max_split_per_batch: int = 256,
+    ) -> None:
+        """Always recomputes the work plan; reuses pre-allocated buffers."""
+        import aiter
+
+        device = qo_indptr.device
+        bs = qo_indptr.shape[0] - 1
+        self._alloc_if_needed(
+            bs, nhead, dtype, kvtype, max_split_per_batch, device,
+        )
 
         aiter.get_mla_metadata_v1(
             qo_indptr, kv_indptr, kv_last_page_lens,
@@ -155,7 +173,6 @@ class AiterSparseScratch:
             topk=topk,
             dtype_q=dtype, dtype_kv=kvtype,
         )
-        self._key = (bs, nhead, topk, dtype, kvtype)
 
 
 def aiter_sparse_attn_decode(
@@ -366,13 +383,15 @@ def _aiter_decode_one_scope(
     q_fp8 = q_flat.to(fp8_dtype)
     kv_fp8 = blocked_k.to(fp8_dtype)
 
-    if not scratch.matches(total_q, h_q, topk_max, fp8_dtype, fp8_dtype):
-        scratch.rebuild(
-            qo_indptr=qo_indptr, kv_indptr=kv_indptr,
-            kv_last_page_lens=kv_last_page_lens,
-            nhead=h_q, nhead_kv=1, page_size=1,
-            topk=topk_max, dtype=fp8_dtype, kvtype=fp8_dtype,
-        )
+    # Always rebuild: buffers are reused via _alloc_if_needed but the work
+    # plan is recomputed every call (it depends on this step's qo_indptr /
+    # kv_indptr / kv_last_page_lens).
+    scratch.rebuild(
+        qo_indptr=qo_indptr, kv_indptr=kv_indptr,
+        kv_last_page_lens=kv_last_page_lens,
+        nhead=h_q, nhead_kv=1, page_size=1,
+        topk=topk_max, dtype=fp8_dtype, kvtype=fp8_dtype,
+    )
 
     out_buf = torch.empty(
         (total_q, h_q, d_v), dtype=torch.bfloat16, device=device)
