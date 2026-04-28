@@ -107,10 +107,26 @@ class AiterSparseScratch:
         max_split_per_batch: int,
         device: torch.device,
     ) -> None:
-        # NB: temporarily disable buffer caching while we hunt the V4-Flash
-        # token-2 garbage-output bug. Always allocate fresh + zero-init so we
-        # can rule out partial-overwrite leftover state.
-        # TODO: re-enable cache once the underlying bug is found.
+        key = (batch_size, nhead, dtype, kvtype, max_split_per_batch, device)
+        if self._alloc_key == key:
+            # Same shape -> reuse buffers, but zero them so previous step's
+            # work plan (which may have a *different* used-prefix length) cannot
+            # leak past the bytes the new rebuild writes. Some aiter versions
+            # appear to leave a tail of stale entries that the kernel still
+            # dereferences, producing garbage from the second decode token.
+            assert self.work_meta_data is not None
+            self.work_meta_data.zero_()
+            assert self.work_indptr is not None
+            self.work_indptr.zero_()
+            assert self.work_info_set is not None
+            self.work_info_set.zero_()
+            assert self.reduce_indptr is not None
+            self.reduce_indptr.zero_()
+            assert self.reduce_final_map is not None
+            self.reduce_final_map.zero_()
+            assert self.reduce_partial_map is not None
+            self.reduce_partial_map.zero_()
+            return
         import aiter
         (
             (wmd_size, wmd_type),
@@ -136,6 +152,7 @@ class AiterSparseScratch:
             rfm_size, dtype=rfm_type, device=device)
         self.reduce_partial_map = torch.zeros(
             rpm_size, dtype=rpm_type, device=device)
+        self._alloc_key = key
 
     def rebuild(
         self,
