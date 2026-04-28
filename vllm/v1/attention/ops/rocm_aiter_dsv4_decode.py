@@ -38,6 +38,22 @@ _DEBUG_MAX = int(os.environ.get("VLLM_DSV4_AITER_DEBUG_MAX", "4"))
 _SKIP_KERNEL = bool(int(os.environ.get("VLLM_DSV4_AITER_SKIP", "0")))
 _dump_count = 0
 
+# AITER persistent-mode FP8 ASM kernels (e.g.
+# `mla_a8w8_qh{16,32,64}_qseqlen{1,4}_gqaratio16_lse_ps`) on gfx950 are
+# designed for the DSv3 MLA layout: `d_qk = kv_lora_rank (512) + rope (64) =
+# 576`. They tile/load Q and K assuming this exact row width, and produce
+# NaN (validated on V4-Flash TP=4 parity sweep, h_q=16, d_v=512) when the
+# input row width is smaller (e.g. 512, the V4-Flash convention with no
+# separate rope dim). To make the kernel produce numerically correct output
+# at any `d_qk <= 576`, we zero-pad both Q and K's last dim to 576 before
+# the call: the padded slice contributes 0 to every dot product (since both
+# sides are zero), so the attention scores are identical to the unpadded
+# version. The output `d_v` slice is still taken from the first `d_v`
+# columns of K, which are the original (unpadded) K rows. This adds at most
+# 12.5% extra K-bandwidth per call, which is acceptable given the only
+# alternative is falling back to the bf16 PyTorch path (~3x slower).
+_AITER_KERNEL_DQK = 576
+
 
 def _t(name: str, t: torch.Tensor | None) -> str:
     if t is None:
@@ -400,6 +416,18 @@ def _aiter_decode_one_scope(
     q_fp8 = q_flat.to(fp8_dtype)
     kv_fp8 = blocked_k.to(fp8_dtype)
 
+    # Zero-pad Q and K's last dim to the AITER kernel's expected d_qk if the
+    # model's d_qk is smaller. See `_AITER_KERNEL_DQK` docstring above for
+    # why this is needed (DSv4-Flash uses d_qk=512, kernel needs 576).
+    if d_qk < _AITER_KERNEL_DQK:
+        pad = _AITER_KERNEL_DQK - d_qk
+        q_fp8 = torch.nn.functional.pad(q_fp8, (0, pad))
+        # blocked_k shape is (n_blk, blk_sz, 1, d_qk) -> pad last dim
+        kv_fp8 = torch.nn.functional.pad(kv_fp8, (0, pad))
+        kernel_d_qk = _AITER_KERNEL_DQK
+    else:
+        kernel_d_qk = d_qk
+
     # Always rebuild: buffers are reused via _alloc_if_needed but the work
     # plan is recomputed every call (it depends on this step's qo_indptr /
     # kv_indptr / kv_last_page_lens).
@@ -413,7 +441,7 @@ def _aiter_decode_one_scope(
     out_buf = torch.empty(
         (total_q, h_q, d_v), dtype=torch.bfloat16, device=device)
 
-    kv_view = kv_fp8.view(-1, 1, 1, d_qk)
+    kv_view = kv_fp8.view(-1, 1, 1, kernel_d_qk)
     q_scale = torch.ones(1, dtype=torch.float32, device=device)
     kv_scale = torch.ones(1, dtype=torch.float32, device=device)
 
