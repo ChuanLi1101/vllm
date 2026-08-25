@@ -97,6 +97,10 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 from vllm.v1.worker.gpu.cudagraph_utils import (
     profile_cudagraph_memory as _profile_cudagraph_memory,
 )
+from vllm.v1.worker.gpu.decode_fastpath import (
+    should_defer_async_output_copy,
+    should_wait_output_copy_before_forward,
+)
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.ec_connector import get_ec_connector
 from vllm.v1.worker.gpu.eplb_utils import EPLBController, step_eplb_after
@@ -200,6 +204,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.is_encoder_decoder = self.model_config.is_encoder_decoder
 
         self.output_copy_stream = torch.cuda.Stream(self.device)
+        self._wait_output_copy_before_forward = (
+            should_wait_output_copy_before_forward(vllm_config)
+        )
+        self._defer_async_output_copy = should_defer_async_output_copy(vllm_config)
+        self._pending_output_copy = False
+        if self._wait_output_copy_before_forward:
+            logger.info_once(
+                "Model Runner V2: waiting for async output copy before forward "
+                "(ROCm TP decode fast path)."
+            )
 
         # Pipeline parallelism.
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
@@ -1356,6 +1370,60 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         return block_tables, slot_mappings
 
+    def _sync_pending_output_copy(self) -> None:
+        if not self._pending_output_copy:
+            return
+        self.output_copy_stream.synchronize()
+        self._pending_output_copy = False
+
+    def _postprocess_and_propose_drafts(
+        self,
+        input_batch: InputBatch,
+        sampler_output: SamplerOutput,
+        num_sampled: torch.Tensor,
+        num_rejected: torch.Tensor,
+        attn_metadata: Any,
+        slot_mappings_by_layer: Any,
+        hidden_states: torch.Tensor,
+        aux_hidden_states: torch.Tensor | None,
+        mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None,
+    ) -> None:
+        self.postprocess_sampled(
+            input_batch.idx_mapping,
+            sampler_output.sampled_token_ids,
+            num_sampled,
+            num_rejected,
+            input_batch.query_start_loc,
+        )
+        if self.speculator is None:
+            return
+
+        assert self.sampler is not None
+        spec_hidden_states = hidden_states
+        if hasattr(self.model, "get_mtp_target_hidden_states"):
+            pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
+            spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
+        with use_workspace_lane(self._draft_workspace_lane):
+            draft_tokens = self.speculator.propose(
+                input_batch,
+                attn_metadata,
+                slot_mappings_by_layer,
+                spec_hidden_states,
+                aux_hidden_states,
+                num_sampled,
+                num_rejected,
+                self.req_states.last_sampled_tokens,
+                self.req_states.next_prefill_tokens,
+                self.sampler.sampling_states.temperature.gpu,
+                self.sampler.sampling_states.seeds.gpu,
+                mm_inputs=mm_inputs,
+            )
+        self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+        if self.adaptive_verification is not None:
+            self.adaptive_verification.record_confidences(
+                self.speculator.draft_token_confidence_probs, input_batch
+            )
+
     def prepare_dummy_attn(
         self, input_batch: InputBatch
     ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
@@ -1507,6 +1575,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 return self._merge_ec_connector_no_forward(
                     scheduler_output, empty_output
                 )
+            if self._wait_output_copy_before_forward:
+                self._sync_pending_output_copy()
 
         # Get batch descriptor and sync across DP ranks.
         num_reqs = len(scheduler_output.num_scheduled_tokens)
@@ -1851,17 +1921,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             sampled_token_ids=None,  # type: ignore
             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
         )
-        # Start async output copy here so that it can overlap with speculator proposal.
-        async_output = AsyncOutput(
-            model_runner_output=model_runner_output,
-            sampler_output=sampler_output,
-            num_sampled_tokens=num_sampled,
-            main_stream=self.main_stream,
-            copy_stream=self.output_copy_stream,
-            check_ep_fault=self.check_ep_fault,
-            routed_experts=routed_experts,
-        )
-
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
         if self.speculator is not None and self.speculator.supports_mm_inputs:
             # Get cached multimodal embeddings for draft forward.
@@ -1874,49 +1933,53 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 input_batch, draft_lookahead=1
             )
 
-        # Postprocess results and update request states.
-        # NOTE: This is intentionally done after creating the AsyncOutput,
-        # ensuring that `copy_event` is recorded before calling postprocess.
-        # This sequencing may slightly reduce latency as async D2H copy does not
-        # need to wait for the postprocess to finish.
-        self.postprocess_sampled(
-            input_batch.idx_mapping,
-            sampler_output.sampled_token_ids,
-            num_sampled,
-            num_rejected,
-            input_batch.query_start_loc,
-        )
+        if self._defer_async_output_copy:
+            self._postprocess_and_propose_drafts(
+                input_batch,
+                sampler_output,
+                num_sampled,
+                num_rejected,
+                attn_metadata,
+                slot_mappings_by_layer,
+                hidden_states,
+                aux_hidden_states,
+                mm_inputs,
+            )
+            async_output = AsyncOutput(
+                model_runner_output=model_runner_output,
+                sampler_output=sampler_output,
+                num_sampled_tokens=num_sampled,
+                main_stream=self.main_stream,
+                copy_stream=self.output_copy_stream,
+                check_ep_fault=self.check_ep_fault,
+                routed_experts=routed_experts,
+            )
+        else:
+            # Legacy ordering (CUDA): start async D2H before postprocess so copy
+            # can overlap CPU-side postprocess work.
+            async_output = AsyncOutput(
+                model_runner_output=model_runner_output,
+                sampler_output=sampler_output,
+                num_sampled_tokens=num_sampled,
+                main_stream=self.main_stream,
+                copy_stream=self.output_copy_stream,
+                check_ep_fault=self.check_ep_fault,
+                routed_experts=routed_experts,
+            )
+            self._postprocess_and_propose_drafts(
+                input_batch,
+                sampler_output,
+                num_sampled,
+                num_rejected,
+                attn_metadata,
+                slot_mappings_by_layer,
+                hidden_states,
+                aux_hidden_states,
+                mm_inputs,
+            )
 
-        if self.speculator is not None:
-            assert self.sampler is not None
-            # Let the target override the hidden state fed to the drafter
-            # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). The
-            # target returns a persistent buffer sized at max_num_batched_tokens;
-            # slice to the active token count that propose() expects.
-            spec_hidden_states = hidden_states
-            if hasattr(self.model, "get_mtp_target_hidden_states"):
-                pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
-                spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
-            with use_workspace_lane(self._draft_workspace_lane):
-                draft_tokens = self.speculator.propose(
-                    input_batch,
-                    attn_metadata,
-                    slot_mappings_by_layer,
-                    spec_hidden_states,
-                    aux_hidden_states,
-                    num_sampled,
-                    num_rejected,
-                    self.req_states.last_sampled_tokens,
-                    self.req_states.next_prefill_tokens,
-                    self.sampler.sampling_states.temperature.gpu,
-                    self.sampler.sampling_states.seeds.gpu,
-                    mm_inputs=mm_inputs,
-                )
-            self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
-            if self.adaptive_verification is not None:
-                self.adaptive_verification.record_confidences(
-                    self.speculator.draft_token_confidence_probs, input_batch
-                )
+        if self._wait_output_copy_before_forward:
+            self._pending_output_copy = True
 
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
